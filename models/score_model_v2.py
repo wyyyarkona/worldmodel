@@ -11,13 +11,16 @@ from .embeddings import (
 )
 from .projectors import ContextProjector, VideoProjector
 from .qwen_comparator import QwenComparator
+from .text_label_embedder import TextLabelEmbedder
 
 
 class ScoreModelV2(nn.Module):
     # Full pairwise score model:
     # f1/f2 latent -> compressed video tokens
-    # text/image embeddings -> context tokens
-    # query + h1 + h2 + context + stage -> Qwen comparator
+    # text/image embeddings -> separate image/text context tokens
+    # Each content segment is preceded by a Qwen-tokenized text label so the
+    # comparator sees explicit "视频 1:" / "视频 2:" / "参考图像:" / "提示词:" /
+    # "阶段:" cues plus a trailing task prompt before the query tokens.
     # pooled query states -> scalar score
     def __init__(
         self,
@@ -48,8 +51,6 @@ class ScoreModelV2(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.readout_mode = str(readout_mode)
-        self.task_prompt = str(task_prompt or "").strip()
-        self._cached_prompt_tokens = None
         if self.readout_mode not in {"query", "h1_h2", "hybrid"}:
             raise ValueError(
                 f"Unsupported readout_mode='{self.readout_mode}'. "
@@ -89,9 +90,23 @@ class ScoreModelV2(nn.Module):
             gradient_checkpointing=gradient_checkpointing,
             bidirectional_attention=bidirectional_attention,
         )
-        readout_input_dim = hidden_dim if self.readout_mode == "query" else hidden_dim * 4
-        if self.readout_mode == "h1_h2":
-            readout_input_dim = hidden_dim * 3
+        # Static Qwen-tokenized cues for section labels + task prompt. The
+        # task_prompt kwarg stays for config compatibility: non-empty strings
+        # override the default prompt baked into TextLabelEmbedder.
+        self.text_labels = TextLabelEmbedder(
+            qwen_model_path=qwen_model_path,
+            hidden_dim=hidden_dim,
+            task_prompt_override=task_prompt,
+        )
+        if self.readout_mode != "query":
+            # Labels are fused into the h1/h2/context segments, so the old
+            # h1_h2 / hybrid slicing would mix content with label tokens.
+            # Fail fast until a label-aware readout is implemented.
+            raise NotImplementedError(
+                "readout_mode='h1_h2' and 'hybrid' are temporarily disabled after "
+                "the text-label refactor. Use readout_mode='query' for now."
+            )
+        readout_input_dim = hidden_dim
         self.score_head = nn.Sequential(
             nn.Linear(readout_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -105,40 +120,52 @@ class ScoreModelV2(nn.Module):
         flat_tokens = self.video_pos_embed(tokens_3d)
         return flat_tokens
 
-    def get_prompt_tokens(self, batch_size: int, device: torch.device, dtype: torch.dtype):
-        if not self.task_prompt:
-            return None
-        if self._cached_prompt_tokens is None:
-            self._cached_prompt_tokens = self.comparator.encode_text_prompt(self.task_prompt).detach()
-        prompt_tokens = self._cached_prompt_tokens
-        prompt_tokens = prompt_tokens.to(device=device, dtype=dtype)
-        if prompt_tokens.size(0) != batch_size:
-            prompt_tokens = prompt_tokens.expand(batch_size, -1, -1).contiguous()
-        return prompt_tokens
+    def _fetch_labels(self, batch_size: int, device: torch.device, dtype: torch.dtype):
+        # One pass to gather all six label/prompt tensors on the right device/dtype.
+        labels = {}
+        for key in TextLabelEmbedder.LABEL_KEYS:
+            tensor = self.text_labels.get(key, batch_size)
+            labels[key] = tensor.to(device=device, dtype=dtype)
+        return labels
 
-    def build_sequence(self, h1, h2, context, stage_id):
-        # Build the exact comparator order from the plan:
-        # [h1 ; h2 ; context ; stage ; prompt ; query]
-        # With causal attention enabled, placing query tokens at the tail lets
-        # them attend to the full comparison context before readout.
+    def build_sequence(self, h1, h2, image_tokens, text_tokens, stage_id):
+        # New order:
+        # ["视频 1:" + h1 ; "视频 2:" + h2 ; "参考图像:" + image + "提示词:" + text ;
+        #  "阶段:" + stage ; task_prompt ; query]
+        # Each label shares the segment embedding of the section it introduces.
+        # task_prompt gets the dedicated "prompt" segment. The query remains at
+        # the tail so causal attention lets it summarize everything before it.
         batch_size = h1.size(0)
+        device = h1.device
+        dtype = h1.dtype
+
+        labels = self._fetch_labels(batch_size=batch_size, device=device, dtype=dtype)
+        stage_token = self.stage_embed(stage_id)
         query = self.query_embed(batch_size)
-        stage = self.stage_embed(stage_id)
-        prompt = self.get_prompt_tokens(batch_size=batch_size, device=h1.device, dtype=h1.dtype)
 
-        # Segment embeddings tell the comparator what each token group represents.
-        query = self.segment_embed.add(query, "query")
-        h1 = self.segment_embed.add(h1, "h1")
-        h2 = self.segment_embed.add(h2, "h2")
-        context = self.segment_embed.add(context, "context")
-        stage = self.segment_embed.add(stage, "stage")
-        prompt_parts = [h1, h2, context, stage]
-        if prompt is not None:
-            prompt = self.segment_embed.add(prompt, "prompt")
-            prompt_parts.append(prompt)
-        prompt_parts.append(query)
+        h1_segment = torch.cat([labels["h1_label"], h1], dim=1)
+        h1_segment = self.segment_embed.add(h1_segment, "h1")
 
-        sequence = torch.cat(prompt_parts, dim=1)
+        h2_segment = torch.cat([labels["h2_label"], h2], dim=1)
+        h2_segment = self.segment_embed.add(h2_segment, "h2")
+
+        context_segment = torch.cat(
+            [labels["image_label"], image_tokens, labels["text_label"], text_tokens],
+            dim=1,
+        )
+        context_segment = self.segment_embed.add(context_segment, "context")
+
+        stage_segment = torch.cat([labels["stage_label"], stage_token], dim=1)
+        stage_segment = self.segment_embed.add(stage_segment, "stage")
+
+        prompt_segment = self.segment_embed.add(labels["task_prompt"], "prompt")
+
+        query_segment = self.segment_embed.add(query, "query")
+
+        sequence = torch.cat(
+            [h1_segment, h2_segment, context_segment, stage_segment, prompt_segment, query_segment],
+            dim=1,
+        )
         attention_mask = torch.ones(
             sequence.size(0),
             sequence.size(1),
@@ -147,61 +174,26 @@ class ScoreModelV2(nn.Module):
         )
         return sequence, attention_mask
 
-    def split_hidden_states(self, hidden_states, h1_len, h2_len, context_len, prompt_len=0):
-        query_len = self.query_embed.query.size(1)
-        h1_hidden = hidden_states[:, :h1_len]
-        h2_hidden = hidden_states[:, h1_len:h1_len + h2_len]
-        context_hidden = hidden_states[:, h1_len + h2_len:h1_len + h2_len + context_len]
-        stage_hidden = hidden_states[:, h1_len + h2_len + context_len:h1_len + h2_len + context_len + 1]
-        prompt_start = h1_len + h2_len + context_len + 1
-        prompt_hidden = hidden_states[:, prompt_start:prompt_start + prompt_len]
-        query_hidden = hidden_states[:, -query_len:]
-        return {
-            "h1": h1_hidden,
-            "h2": h2_hidden,
-            "context": context_hidden,
-            "stage": stage_hidden,
-            "prompt": prompt_hidden,
-            "query": query_hidden,
-        }
-
-    def build_readout_features(self, hidden_parts):
-        query_pooled = hidden_parts["query"].mean(dim=1)
-        h1_pooled = hidden_parts["h1"].mean(dim=1)
-        h2_pooled = hidden_parts["h2"].mean(dim=1)
-        if self.readout_mode == "query":
-            return query_pooled
-        if self.readout_mode == "h1_h2":
-            return torch.cat(
-                [h1_pooled, h2_pooled, h1_pooled - h2_pooled],
-                dim=-1,
-            )
-        return torch.cat(
-            [query_pooled, h1_pooled, h2_pooled, h1_pooled - h2_pooled],
-            dim=-1,
-        )
-
     def forward(self, f1, f2, text_emb, image_emb, stage_id, return_aux_stats=False):
-        # Encode both candidate latents with shared projector weights.
+        # Encode both candidate latents with shared projector weights, then
+        # project text/image separately so the comparator sees each conditioning
+        # stream behind its own label token.
         h1 = self.encode_video(f1)
         h2 = self.encode_video(f2)
-        context = self.context_projector(text_emb, image_emb)
-        prompt_len = 0 if not self.task_prompt else self.get_prompt_tokens(1, h1.device, h1.dtype).size(1)
+        image_tokens = self.context_projector.project_image(image_emb)
+        text_tokens = self.context_projector.project_text(text_emb)
 
-        # Only the trailing query slice is used for the final decision head.
-        sequence, attention_mask = self.build_sequence(h1, h2, context, stage_id)
+        sequence, attention_mask = self.build_sequence(h1, h2, image_tokens, text_tokens, stage_id)
         comparator_param = next(self.comparator.parameters())
         sequence = sequence.to(device=comparator_param.device, dtype=comparator_param.dtype)
         attention_mask = attention_mask.to(device=comparator_param.device)
         hidden_states = self.comparator(sequence, attention_mask=attention_mask)
-        hidden_parts = self.split_hidden_states(
-            hidden_states,
-            h1_len=h1.size(1),
-            h2_len=h2.size(1),
-            context_len=context.size(1),
-            prompt_len=prompt_len,
-        )
-        readout_features = self.build_readout_features(hidden_parts)
+
+        # Query tokens are always the final num_query_tokens positions.
+        num_queries = self.query_embed.query.size(1)
+        query_hidden = hidden_states[:, -num_queries:]
+        readout_features = query_hidden.mean(dim=1)
+
         head_param = next(self.score_head.parameters())
         readout_features = readout_features.to(device=head_param.device, dtype=head_param.dtype)
         logit = self.score_head(readout_features).squeeze(-1)
@@ -213,7 +205,9 @@ class ScoreModelV2(nn.Module):
         }
         if return_aux_stats:
             # Warmup uses the projector output statistics as an auxiliary alignment target.
-            projector_tokens = torch.cat([h1, h2, context], dim=1)
+            # We keep the same content that feeds the comparator (image + text combined)
+            # so the alignment target matches what the downstream layers actually see.
+            projector_tokens = torch.cat([h1, h2, image_tokens, text_tokens], dim=1)
             outputs["proj_mean"] = projector_tokens.mean(dim=(0, 1))
             outputs["proj_std"] = projector_tokens.std(dim=(0, 1), unbiased=False)
         return outputs

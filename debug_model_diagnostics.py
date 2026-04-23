@@ -86,24 +86,22 @@ def run_diagnostics(model, batch):
 
     h1 = model.encode_video(f1)
     h2 = model.encode_video(f2)
-    context = model.context_projector(text_emb, image_emb)
-    sequence, attention_mask = model.build_sequence(h1, h2, context, stage_id)
+    # After the text-label refactor, image/text projections are fed separately
+    # into build_sequence and the comparator-side segment layout mixes label
+    # tokens into each content block, so old per-segment slicing is no longer
+    # reliable. We keep query-centric diagnostics only.
+    image_tokens = model.context_projector.project_image(image_emb)
+    text_tokens = model.context_projector.project_text(text_emb)
+    sequence, attention_mask = model.build_sequence(h1, h2, image_tokens, text_tokens, stage_id)
     query_len = model.query_embed.query.size(1)
-    h1_len = h1.size(1)
-    h2_len = h2.size(1)
-    context_len = context.size(1)
     query_input = sequence[:, -query_len:]
 
     comparator_param = next(model.comparator.parameters())
     sequence = sequence.to(device=comparator_param.device, dtype=comparator_param.dtype)
     attention_mask = attention_mask.to(device=comparator_param.device)
     hidden_states = model.comparator(sequence, attention_mask=attention_mask)
-    hidden_parts = model.split_hidden_states(hidden_states, h1_len=h1_len, h2_len=h2_len, context_len=context_len)
-    query_hidden = hidden_parts["query"]
-    h1_hidden = hidden_parts["h1"]
-    h2_hidden = hidden_parts["h2"]
-    context_hidden = hidden_parts["context"]
-    readout_features = model.build_readout_features(hidden_parts)
+    query_hidden = hidden_states[:, -query_len:]
+    readout_features = query_hidden.mean(dim=1)
 
     head_param = next(model.score_head.parameters())
     readout_features = readout_features.to(device=head_param.device, dtype=head_param.dtype)
@@ -116,23 +114,17 @@ def run_diagnostics(model, batch):
 
     swapped_h1 = model.encode_video(f2)
     swapped_h2 = model.encode_video(f1)
-    swapped_context = model.context_projector(text_emb, image_emb)
-    swapped_sequence, swapped_attention_mask = model.build_sequence(swapped_h1, swapped_h2, swapped_context, stage_id)
+    swapped_image_tokens = model.context_projector.project_image(image_emb)
+    swapped_text_tokens = model.context_projector.project_text(text_emb)
+    swapped_sequence, swapped_attention_mask = model.build_sequence(
+        swapped_h1, swapped_h2, swapped_image_tokens, swapped_text_tokens, stage_id
+    )
     swapped_query_input = swapped_sequence[:, -query_len:]
     swapped_sequence = swapped_sequence.to(device=comparator_param.device, dtype=comparator_param.dtype)
     swapped_attention_mask = swapped_attention_mask.to(device=comparator_param.device)
     swapped_hidden_states = model.comparator(swapped_sequence, attention_mask=swapped_attention_mask)
-    swapped_hidden_parts = model.split_hidden_states(
-        swapped_hidden_states,
-        h1_len=h1_len,
-        h2_len=h2_len,
-        context_len=context_len,
-    )
-    swapped_query_hidden = swapped_hidden_parts["query"]
-    swapped_h1_hidden = swapped_hidden_parts["h1"]
-    swapped_h2_hidden = swapped_hidden_parts["h2"]
-    swapped_context_hidden = swapped_hidden_parts["context"]
-    swapped_readout = model.build_readout_features(swapped_hidden_parts)
+    swapped_query_hidden = swapped_hidden_states[:, -query_len:]
+    swapped_readout = swapped_query_hidden.mean(dim=1)
 
     score_head_weight = next(model.score_head.parameters()).detach().to(dtype=torch.float32)
     last_linear = None
@@ -158,9 +150,13 @@ def run_diagnostics(model, batch):
             "variation_across_samples": sample_variation_summary(h2),
         },
         "h1_vs_h2": pairwise_difference_summary(h1, h2),
-        "context": {
-            "tensor": tensor_summary(context),
-            "variation_across_samples": sample_variation_summary(context),
+        "image_tokens": {
+            "tensor": tensor_summary(image_tokens),
+            "variation_across_samples": sample_variation_summary(image_tokens),
+        },
+        "text_tokens": {
+            "tensor": tensor_summary(text_tokens),
+            "variation_across_samples": sample_variation_summary(text_tokens),
         },
         "query_input": {
             "tensor": tensor_summary(query_input),
@@ -170,24 +166,7 @@ def run_diagnostics(model, batch):
             "tensor": tensor_summary(query_hidden),
             "variation_across_samples": sample_variation_summary(query_hidden),
         },
-        "h1_hidden": {
-            "tensor": tensor_summary(h1_hidden),
-            "variation_across_samples": sample_variation_summary(h1_hidden),
-        },
-        "h2_hidden": {
-            "tensor": tensor_summary(h2_hidden),
-            "variation_across_samples": sample_variation_summary(h2_hidden),
-        },
-        "context_hidden": {
-            "tensor": tensor_summary(context_hidden),
-            "variation_across_samples": sample_variation_summary(context_hidden),
-        },
         "query_input_vs_query_hidden": pairwise_difference_summary(query_input, query_hidden),
-        "h1_vs_h1_hidden": pairwise_difference_summary(sequence[:, :h1_len], h1_hidden),
-        "h2_vs_h2_hidden": pairwise_difference_summary(
-            sequence[:, h1_len:h1_len + h2_len],
-            h2_hidden,
-        ),
         "readout_features": {
             "tensor": tensor_summary(readout_features),
             "variation_across_samples": sample_variation_summary(readout_features),
@@ -201,9 +180,6 @@ def run_diagnostics(model, batch):
             "score_abs_diff_max": float((scores.detach().to(dtype=torch.float32) - swapped_scores).abs().max().item()),
             "query_input_abs_diff": pairwise_difference_summary(query_input, swapped_query_input),
             "query_hidden_abs_diff": pairwise_difference_summary(query_hidden, swapped_query_hidden),
-            "h1_hidden_abs_diff": pairwise_difference_summary(h1_hidden, swapped_h1_hidden),
-            "h2_hidden_abs_diff": pairwise_difference_summary(h2_hidden, swapped_h2_hidden),
-            "context_hidden_abs_diff": pairwise_difference_summary(context_hidden, swapped_context_hidden),
             "readout_abs_diff": pairwise_difference_summary(readout_features, swapped_readout),
         },
     }
