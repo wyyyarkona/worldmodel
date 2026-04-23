@@ -1,0 +1,59 @@
+paths:
+  train_manifest: ../data/score_model_data/openvid_i2v_81f/manifests/pairs_train.jsonl
+  val_manifest: ../data/score_model_data/openvid_i2v_81f/manifests/pairs_val.jsonl
+  output_dir: outputs/score_model_v2
+  repo_root: .
+  models_root: ../models
+  data_root: ../data/score_model_data/openvid_i2v_81f
+
+model:
+  qwen_model_path: ../models/Qwen2.5-VL-3B-Instruct
+  latent_dim: 16
+  patch_dim: 1536
+  hidden_dim: 2048
+  text_dim: 4096
+  image_dim: 1280
+  frames: 11
+  height: 15
+  width: 26
+  context_max_text_tokens: 512
+  context_max_image_tokens: 64
+  num_query_tokens: 4
+  num_qwen_layers: 6
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  bidirectional_attention: false
+  readout_mode: query
+  task_prompt: "You are comparing two candidate video representations conditioned on the same prompt and reference. Determine whether candidate A is better than candidate B based on overall video quality, alignment with the condition, and physical consistency."
+  freeze_qwen_backbone: true
+  gradient_checkpointing: true
+
+loss:
+  tau: 0.3
+  margin: 0.05
+  warmup_alignment_weight: 0.1
+
+training:
+  batch_size: 2
+  num_workers: 4
+  checkpoint_interval_epochs: 5
+  warmup_lr: 1.0e-4
+  lora_lr: 5.0e-5
+  base_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  epochs:
+    warmup: 1
+    lora: 3
+    curriculum: 1
+  curriculum:
+    warmup_stages: [0, 1, 2]
+    lora_stages: [0, 1, 2]
+    curriculum_stage_ids: [2, 1, 0]
+  smoke_test:
+    max_train_samples: 8
+    max_val_samples: 4
+    max_train_steps_per_epoch: 2
+    max_eval_steps: 1

@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 模型权重和 checkpoint(绝对不要上传!)
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+checkpoints/
+models/
+weights/
+
+# 训练输出
+outputs/
+runs/
+logs/
+wandb/
+*.log
+
+# 数据
+data/
+datasets/
+*.csv
+*.parquet
+
+# 临时文件
+tmp/
+temp/
+
+# 环境变量(可能有密钥)
+.env
+.env.local
